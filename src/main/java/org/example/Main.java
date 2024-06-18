@@ -1,6 +1,9 @@
 package org.example;
 
+import com.savarese.rocksaw.net.RawSocket;
 import org.savarese.vserv.tcpip.ICMPEchoPacket;
+import org.savarese.vserv.tcpip.ICMPPacket;
+import org.savarese.vserv.tcpip.IPPacket;
 import org.savarese.vserv.tcpip.OctetConverter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -8,9 +11,15 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.net.Inet6Address;
 import java.net.InetAddress;
+import java.net.SocketException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+
+import static com.savarese.rocksaw.net.RawSocket.PF_INET;
+import static com.savarese.rocksaw.net.RawSocket.PF_INET6;
+import static com.savarese.rocksaw.net.RawSocket.getProtocolByName;
+import static org.savarese.vserv.tcpip.ICMPPacket.OFFSET_ICMP_CHECKSUM;
 
 public class Main {
     private static final Logger log = LoggerFactory.getLogger(Main.class);
@@ -96,6 +105,199 @@ public class Main {
         } catch (final Exception e) {
             executor.shutdown();
             e.printStackTrace();
+        }
+    }
+
+    public interface EchoReplyListener {
+        void notifyEchoReply(ICMPEchoPacket packet, byte[] data, int dataOffset, byte[] srcAddress) throws IOException;
+    }
+
+    public static class Pinger {
+        private static final int TIMEOUT = 10000;
+
+        protected RawSocket      socket;
+        protected ICMPEchoPacket sendPacket, recvPacket;
+        protected int offset, length, dataOffset;
+        protected int requestType, replyType;
+        protected byte[] sendData, recvData, srcAddress;
+        protected int sequence, identifier;
+        protected EchoReplyListener listener;
+
+        protected Pinger(final int id, final int protocolFamily, final int protocol) throws IOException {
+            sequence = 0;
+            identifier = id;
+            setEchoReplyListener(null);
+
+            sendPacket = new ICMPEchoPacket(1);
+            recvPacket = new ICMPEchoPacket(1);
+            sendData = new byte[84];
+            recvData = new byte[84];
+
+            sendPacket.setData(sendData);
+            recvPacket.setData(recvData);
+            sendPacket.setIPHeaderLength(5);
+            recvPacket.setIPHeaderLength(5);
+            sendPacket.setICMPDataByteLength(56);
+            recvPacket.setICMPDataByteLength(56);
+
+            offset = sendPacket.getIPHeaderByteLength();
+            dataOffset = offset + sendPacket.getICMPHeaderByteLength();
+            length = sendPacket.getICMPPacketByteLength();
+
+            socket = new RawSocket();
+            socket.open(protocolFamily, protocol);
+
+            try {
+                socket.setSendTimeout(TIMEOUT);
+                socket.setReceiveTimeout(TIMEOUT);
+            } catch (final SocketException se) {
+                socket.setUseSelectTimeout(true);
+                socket.setSendTimeout(TIMEOUT);
+                socket.setReceiveTimeout(TIMEOUT);
+            }
+        }
+
+        public Pinger(final int id) throws IOException {
+            this(id, PF_INET, getProtocolByName("icmp"));
+
+            srcAddress = new byte[4];
+            requestType = ICMPPacket.TYPE_ECHO_REQUEST;
+            replyType = ICMPPacket.TYPE_ECHO_REPLY;
+        }
+
+        protected void computeSendChecksum(final InetAddress host)
+                throws IOException {
+            sendPacket.computeICMPChecksum();
+        }
+
+        public void setEchoReplyListener(final EchoReplyListener l) {
+            listener = l;
+        }
+
+        /**
+         * Closes the raw socket opened by the constructor.  After calling
+         * this method, the object cannot be used.
+         */
+        public void close() throws IOException {
+            socket.close();
+        }
+
+        public void sendEchoRequest(final InetAddress host) throws IOException {
+            sendPacket.setType(requestType);
+            sendPacket.setCode(0);
+            sendPacket.setIdentifier(identifier);
+            sendPacket.setSequenceNumber(sequence++);
+
+            OctetConverter.longToOctets(System.nanoTime(), sendData, dataOffset);
+
+            computeSendChecksum(host);
+
+            socket.write(host, sendData, offset, length);
+        }
+
+        public void receive() throws IOException {
+            socket.read(recvData, srcAddress);
+        }
+
+        public void receiveEchoReply() throws IOException {
+            do {
+                receive();
+            } while (recvPacket.getType() != replyType || recvPacket.getIdentifier() != identifier);
+
+            if (listener != null) {
+                listener.notifyEchoReply(recvPacket, recvData, dataOffset, srcAddress);
+            }
+        }
+
+        /**
+         * @return The number of bytes in the data portion of the ICMP ping request
+         * packet.
+         */
+        public int getRequestDataLength() {
+            return sendPacket.getICMPDataByteLength();
+        }
+
+        /**
+         * @return The number of bytes in the entire IP ping request packet.
+         */
+        public int getRequestPacketLength() {
+            return sendPacket.getIPPacketLength();
+        }
+    }
+
+    public static class PingerIPv6 extends Pinger {
+        private static final int IPPROTO_ICMPV6           = 58;
+        private static final int ICMPv6_TYPE_ECHO_REQUEST = 128;
+        private static final int ICMPv6_TYPE_ECHO_REPLY   = 129;
+        private final byte[]                   localAddress;
+        private final ICMPv6ChecksumCalculator icmpv6Checksummer;
+
+        public PingerIPv6(final int id) throws IOException {
+            super(id, PF_INET6, IPPROTO_ICMPV6 /*getProtocolByName("ipv6-icmp")*/);
+
+            icmpv6Checksummer = new ICMPv6ChecksumCalculator();
+            srcAddress = new byte[16];
+            localAddress = new byte[16];
+            requestType = ICMPv6_TYPE_ECHO_REQUEST;
+            replyType = ICMPv6_TYPE_ECHO_REPLY;
+        }
+
+        protected void computeSendChecksum(final InetAddress host)
+                throws IOException {
+            // This is necessary only for Windows, which doesn't implement
+            // RFC 2463 correctly.
+            socket.getSourceAddressForDestination(host, localAddress);
+            icmpv6Checksummer.computeChecksum(sendData, sendPacket,
+                    host.getAddress(), localAddress);
+        }
+
+        public void receive() throws IOException {
+            socket.read(recvData, offset, length, srcAddress);
+        }
+
+        public int getRequestPacketLength() {
+            return (getRequestDataLength() + 40);
+        }
+
+        /**
+         * Operating system kernels are supposed to calculate the ICMPv6
+         * checksum for the sender, but Microsoft's IPv6 stack does not do
+         * this.  Nor does it support the IPV6_CHECKSUM socket option.
+         * Therefore, in order to work on the Windows family of operating
+         * systems, we have to calculate the ICMPv6 checksum.
+         */
+        private static class ICMPv6ChecksumCalculator extends IPPacket {
+            ICMPv6ChecksumCalculator() {
+                super(1);
+            }
+
+            private int computeVirtualHeaderTotal(final byte[] destination, final byte[] source, final int icmpLength) {
+                int total = 0;
+
+                for (int i = 0; i < source.length; ) {
+                    total += (((source[i++] & 0xff) << 8) | (source[i++] & 0xff));
+                }
+                for (int i = 0; i < destination.length; ) {
+                    total += (((destination[i++] & 0xff) << 8) | (destination[i++] & 0xff));
+                }
+
+                total += (icmpLength >>> 16);
+                total += (icmpLength & 0xffff);
+                total += IPPROTO_ICMPV6;
+
+                return total;
+            }
+
+            int computeChecksum(final byte[] data, final ICMPPacket packet, final byte[] destination, final byte[] source) {
+                final int startOffset = packet.getIPHeaderByteLength();
+                final int checksumOffset = startOffset + OFFSET_ICMP_CHECKSUM;
+                final int ipLength = packet.getIPPacketLength();
+                final int icmpLength = packet.getICMPPacketByteLength();
+
+                setData(data);
+
+                return _computeChecksum_(startOffset, checksumOffset, ipLength, computeVirtualHeaderTotal(destination, source, icmpLength), true);
+            }
         }
     }
 }
